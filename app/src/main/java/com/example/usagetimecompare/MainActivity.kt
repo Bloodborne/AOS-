@@ -6,14 +6,19 @@ import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.text.InputType
 import android.util.Log
 import android.view.ViewGroup
+import android.view.WindowInsets
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import java.text.SimpleDateFormat
@@ -25,6 +30,7 @@ class MainActivity : Activity() {
 
     private lateinit var targetInput: EditText
     private lateinit var resultView: TextView
+    private lateinit var appListGroup: RadioGroup
     private val defaultTargetPackageName = "com.example.game"
     private val prefs by lazy { getSharedPreferences("usage_compare", Context.MODE_PRIVATE) }
 
@@ -72,9 +78,18 @@ class MainActivity : Activity() {
             setOnClickListener { runComparison() }
         }
 
+        val loadAppsButton = Button(this).apply {
+            text = "列出今天用过的应用"
+            setOnClickListener { loadTodayUsedApps() }
+        }
+
         val settingsButton = Button(this).apply {
             text = "打开使用情况访问权限"
             setOnClickListener { startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) }
+        }
+
+        appListGroup = RadioGroup(this).apply {
+            orientation = RadioGroup.VERTICAL
         }
 
         resultView = TextView(this).apply {
@@ -84,10 +99,37 @@ class MainActivity : Activity() {
 
         root.addView(targetInput)
         root.addView(compareButton)
+        root.addView(loadAppsButton)
         root.addView(settingsButton)
+        root.addView(appListGroup)
         root.addView(resultView)
 
-        setContentView(ScrollView(this).apply { addView(root) })
+        setContentView(ScrollView(this).apply {
+            clipToPadding = false
+            addView(root)
+            setOnApplyWindowInsetsListener { view, insets ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    val systemInsets = insets.getInsets(
+                        WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout()
+                    )
+                    view.setPadding(
+                        systemInsets.left,
+                        systemInsets.top,
+                        systemInsets.right,
+                        systemInsets.bottom
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    view.setPadding(
+                        insets.systemWindowInsetLeft,
+                        insets.systemWindowInsetTop,
+                        insets.systemWindowInsetRight,
+                        insets.systemWindowInsetBottom
+                    )
+                }
+                insets
+            }
+        })
     }
 
     private fun runComparison() {
@@ -103,13 +145,7 @@ class MainActivity : Activity() {
         }
         prefs.edit().putString("target_package", targetPackageName).apply()
 
-        val calendar = Calendar.getInstance()
-        calendar.set(Calendar.HOUR_OF_DAY, 0)
-        calendar.set(Calendar.MINUTE, 0)
-        calendar.set(Calendar.SECOND, 0)
-        calendar.set(Calendar.MILLISECOND, 0)
-        val beginTime = calendar.timeInMillis
-        val endTime = System.currentTimeMillis()
+        val (beginTime, endTime) = todayWindow()
 
         val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
 
@@ -155,6 +191,59 @@ class MainActivity : Activity() {
 
         resultView.text = resultText
         Log.d("TimeTrackerDemo", resultText)
+    }
+
+    private fun loadTodayUsedApps() {
+        if (!hasUsageStatsPermission()) {
+            resultView.text = "未授予【使用情况访问权限】，无法列出应用。"
+            return
+        }
+
+        val (beginTime, endTime) = todayWindow()
+        val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+        val usedApps = usageStatsManager
+            .queryUsageStats(UsageStatsManager.INTERVAL_DAILY, beginTime, endTime)
+            .orEmpty()
+            .filter { it.totalTimeInForeground > 0L }
+            .groupBy { it.packageName }
+            .map { (packageName, stats) ->
+                UsedApp(
+                    packageName = packageName,
+                    label = loadAppLabel(packageName),
+                    totalTimeMs = stats.sumOf { it.totalTimeInForeground }
+                )
+            }
+            .sortedByDescending { it.totalTimeMs }
+
+        appListGroup.removeAllViews()
+        if (usedApps.isEmpty()) {
+            resultView.text = "今天的使用记录里没有可选应用。请确认权限已授予，并且目标应用今天打开过。"
+            return
+        }
+
+        usedApps.take(30).forEach { app ->
+            val radioButton = RadioButton(this).apply {
+                text = "${app.label}\n${app.packageName}\n${formatDuration(app.totalTimeMs)}"
+                textSize = 14f
+                setPadding(0, 12, 0, 12)
+                setOnClickListener {
+                    targetInput.setText(app.packageName)
+                    runComparison()
+                }
+            }
+            appListGroup.addView(radioButton)
+        }
+
+        resultView.text = "已列出今天使用过的前 ${minOf(usedApps.size, 30)} 个应用。点选应用后会自动对比。"
+    }
+
+    private fun todayWindow(): Pair<Long, Long> {
+        val calendar = Calendar.getInstance()
+        calendar.set(Calendar.HOUR_OF_DAY, 0)
+        calendar.set(Calendar.MINUTE, 0)
+        calendar.set(Calendar.SECOND, 0)
+        calendar.set(Calendar.MILLISECOND, 0)
+        return calendar.timeInMillis to System.currentTimeMillis()
     }
 
     private fun calculateFromEvents(
@@ -242,6 +331,15 @@ class MainActivity : Activity() {
         return formatter.format(Date(timeMs))
     }
 
+    private fun loadAppLabel(packageName: String): String {
+        return try {
+            val appInfo = packageManager.getApplicationInfo(packageName, 0)
+            packageManager.getApplicationLabel(appInfo).toString()
+        } catch (_: PackageManager.NameNotFoundException) {
+            packageName
+        }
+    }
+
     private data class EventResult(
         val totalTimeMs: Long,
         val targetEventCount: Int,
@@ -251,5 +349,11 @@ class MainActivity : Activity() {
         val openSessionStartedAt: Long,
         val firstEventTime: Long?,
         val lastEventTime: Long?
+    )
+
+    private data class UsedApp(
+        val packageName: String,
+        val label: String,
+        val totalTimeMs: Long
     )
 }
