@@ -6,11 +6,16 @@ import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.text.Editable
 import android.text.InputType
+import android.text.TextWatcher
 import android.util.Log
 import android.view.ViewGroup
 import android.view.WindowInsets
@@ -22,15 +27,18 @@ import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import java.text.SimpleDateFormat
-import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import kotlin.math.max
 
 class MainActivity : Activity() {
 
     private lateinit var targetInput: EditText
+    private lateinit var daysInput: EditText
+    private lateinit var searchInput: EditText
     private lateinit var resultView: TextView
     private lateinit var appListGroup: RadioGroup
+    private var installedApps: List<SelectableApp> = emptyList()
     private val defaultTargetPackageName = "com.example.game"
     private val prefs by lazy { getSharedPreferences("usage_compare", Context.MODE_PRIVATE) }
 
@@ -56,21 +64,58 @@ class MainActivity : Activity() {
     }
 
     private fun setupUi() {
-        val padding = 32
+        val pagePadding = 28
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(padding, padding, padding, padding)
+            setPadding(pagePadding, pagePadding, pagePadding, pagePadding)
+            setBackgroundColor(Color.rgb(246, 248, 250))
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
         }
 
+        val titleView = TextView(this).apply {
+            text = "使用时长 API 对比"
+            textSize = 22f
+            setTextColor(Color.rgb(24, 32, 41))
+        }
+
+        val subtitleView = TextView(this).apply {
+            text = "选择应用和时间范围，对比系统汇总与事件流水。"
+            textSize = 14f
+            setTextColor(Color.rgb(91, 103, 112))
+            setPadding(0, 8, 0, 18)
+        }
+
+        val rangeLabel = label("统计范围")
+        daysInput = EditText(this).apply {
+            hint = "最近几天，例如 10"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setSingleLine(true)
+            setText(prefs.getInt("days", 1).toString())
+        }
+
+        val packageLabel = label("目标应用")
         targetInput = EditText(this).apply {
-            hint = "目标应用包名，例如 com.tencent.tmgp.sgame"
+            hint = "包名，例如 com.tencent.tmgp.sgame"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             setSingleLine(true)
             setText(prefs.getString("target_package", defaultTargetPackageName))
+        }
+
+        val searchLabel = label("搜索手机上的应用")
+        searchInput = EditText(this).apply {
+            hint = "输入应用名或包名"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setSingleLine(true)
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                    renderAppList(s?.toString().orEmpty())
+                }
+                override fun afterTextChanged(s: Editable?) = Unit
+            })
         }
 
         val compareButton = Button(this).apply {
@@ -79,8 +124,8 @@ class MainActivity : Activity() {
         }
 
         val loadAppsButton = Button(this).apply {
-            text = "列出今天用过的应用"
-            setOnClickListener { loadTodayUsedApps() }
+            text = "加载应用列表"
+            setOnClickListener { loadInstalledApps() }
         }
 
         val settingsButton = Button(this).apply {
@@ -94,15 +139,25 @@ class MainActivity : Activity() {
 
         resultView = TextView(this).apply {
             textSize = 15f
+            setTextColor(Color.rgb(24, 32, 41))
             setTextIsSelectable(true)
+            setPadding(24, 24, 24, 24)
+            background = roundedBackground(Color.WHITE)
         }
 
+        root.addView(titleView)
+        root.addView(subtitleView)
+        root.addView(rangeLabel)
+        root.addView(daysInput)
+        root.addView(packageLabel)
         root.addView(targetInput)
         root.addView(compareButton)
-        root.addView(loadAppsButton)
         root.addView(settingsButton)
-        root.addView(appListGroup)
         root.addView(resultView)
+        root.addView(searchLabel)
+        root.addView(searchInput)
+        root.addView(loadAppsButton)
+        root.addView(appListGroup)
 
         setContentView(ScrollView(this).apply {
             clipToPadding = false
@@ -130,6 +185,24 @@ class MainActivity : Activity() {
                 insets
             }
         })
+
+        loadInstalledApps()
+    }
+
+    private fun label(text: String): TextView {
+        return TextView(this).apply {
+            this.text = text
+            textSize = 13f
+            setTextColor(Color.rgb(76, 88, 99))
+            setPadding(0, 18, 0, 6)
+        }
+    }
+
+    private fun roundedBackground(color: Int): GradientDrawable {
+        return GradientDrawable().apply {
+            setColor(color)
+            cornerRadius = 8f
+        }
     }
 
     private fun runComparison() {
@@ -143,9 +216,11 @@ class MainActivity : Activity() {
             resultView.text = "请输入目标应用包名。"
             return
         }
+        val days = parseDays()
         prefs.edit().putString("target_package", targetPackageName).apply()
+        prefs.edit().putInt("days", days).apply()
 
-        val (beginTime, endTime) = todayWindow()
+        val (beginTime, endTime) = recentDaysWindow(days)
 
         val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
 
@@ -164,6 +239,7 @@ class MainActivity : Activity() {
 
         val resultText = """
             测试目标: $targetPackageName
+            统计范围: 最近 $days 天
             统计窗口: ${formatTime(formatter, beginTime)} - ${formatTime(formatter, endTime)}
 
             【方法一：queryUsageStats】
@@ -193,38 +269,45 @@ class MainActivity : Activity() {
         Log.d("TimeTrackerDemo", resultText)
     }
 
-    private fun loadTodayUsedApps() {
-        if (!hasUsageStatsPermission()) {
-            resultView.text = "未授予【使用情况访问权限】，无法列出应用。"
-            return
-        }
-
-        val (beginTime, endTime) = todayWindow()
-        val usageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
-        val usedApps = usageStatsManager
-            .queryUsageStats(UsageStatsManager.INTERVAL_DAILY, beginTime, endTime)
-            .orEmpty()
-            .filter { it.totalTimeInForeground > 0L }
-            .groupBy { it.packageName }
-            .map { (packageName, stats) ->
-                UsedApp(
-                    packageName = packageName,
-                    label = loadAppLabel(packageName),
-                    totalTimeMs = stats.sumOf { it.totalTimeInForeground }
+    private fun loadInstalledApps() {
+        installedApps = packageManager
+            .getInstalledApplications(PackageManager.GET_META_DATA)
+            .filter { it.enabled }
+            .map { appInfo ->
+                SelectableApp(
+                    packageName = appInfo.packageName,
+                    label = packageManager.getApplicationLabel(appInfo).toString(),
+                    isSystemApp = appInfo.flags and ApplicationInfo.FLAG_SYSTEM != 0
                 )
             }
-            .sortedByDescending { it.totalTimeMs }
+            .sortedWith(compareBy<SelectableApp> { it.isSystemApp }.thenBy { it.label.lowercase(Locale.getDefault()) })
 
-        appListGroup.removeAllViews()
-        if (usedApps.isEmpty()) {
-            resultView.text = "今天的使用记录里没有可选应用。请确认权限已授予，并且目标应用今天打开过。"
+        renderAppList(searchInput.text?.toString().orEmpty())
+    }
+
+    private fun renderAppList(query: String) {
+        if (installedApps.isEmpty()) {
+            appListGroup.removeAllViews()
             return
         }
 
-        usedApps.take(30).forEach { app ->
+        val normalizedQuery = query.trim().lowercase(Locale.getDefault())
+        val filteredApps = installedApps
+            .asSequence()
+            .filter {
+                normalizedQuery.isEmpty() ||
+                    it.label.lowercase(Locale.getDefault()).contains(normalizedQuery) ||
+                    it.packageName.lowercase(Locale.getDefault()).contains(normalizedQuery)
+            }
+            .take(50)
+            .toList()
+
+        appListGroup.removeAllViews()
+        filteredApps.forEach { app ->
             val radioButton = RadioButton(this).apply {
-                text = "${app.label}\n${app.packageName}\n${formatDuration(app.totalTimeMs)}"
+                text = "${app.label}\n${app.packageName}${if (app.isSystemApp) "\n系统应用" else ""}"
                 textSize = 14f
+                setTextColor(Color.rgb(24, 32, 41))
                 setPadding(0, 12, 0, 12)
                 setOnClickListener {
                     targetInput.setText(app.packageName)
@@ -234,16 +317,22 @@ class MainActivity : Activity() {
             appListGroup.addView(radioButton)
         }
 
-        resultView.text = "已列出今天使用过的前 ${minOf(usedApps.size, 30)} 个应用。点选应用后会自动对比。"
+        resultView.text = when {
+            filteredApps.isEmpty() -> "没有匹配的应用。换个应用名或包名搜索。"
+            normalizedQuery.isEmpty() -> "已加载 ${installedApps.size} 个应用，当前显示前 ${filteredApps.size} 个。输入关键词可搜索。"
+            else -> "找到 ${filteredApps.size} 个匹配应用。点选应用后会自动对比。"
+        }
     }
 
-    private fun todayWindow(): Pair<Long, Long> {
-        val calendar = Calendar.getInstance()
-        calendar.set(Calendar.HOUR_OF_DAY, 0)
-        calendar.set(Calendar.MINUTE, 0)
-        calendar.set(Calendar.SECOND, 0)
-        calendar.set(Calendar.MILLISECOND, 0)
-        return calendar.timeInMillis to System.currentTimeMillis()
+    private fun recentDaysWindow(days: Int): Pair<Long, Long> {
+        val endTime = System.currentTimeMillis()
+        val beginTime = endTime - days * 24L * 60L * 60L * 1000L
+        return beginTime to endTime
+    }
+
+    private fun parseDays(): Int {
+        val rawValue = daysInput.text.toString().trim().toIntOrNull() ?: 1
+        return max(1, rawValue)
     }
 
     private fun calculateFromEvents(
@@ -331,15 +420,6 @@ class MainActivity : Activity() {
         return formatter.format(Date(timeMs))
     }
 
-    private fun loadAppLabel(packageName: String): String {
-        return try {
-            val appInfo = packageManager.getApplicationInfo(packageName, 0)
-            packageManager.getApplicationLabel(appInfo).toString()
-        } catch (_: PackageManager.NameNotFoundException) {
-            packageName
-        }
-    }
-
     private data class EventResult(
         val totalTimeMs: Long,
         val targetEventCount: Int,
@@ -351,9 +431,9 @@ class MainActivity : Activity() {
         val lastEventTime: Long?
     )
 
-    private data class UsedApp(
+    private data class SelectableApp(
         val packageName: String,
         val label: String,
-        val totalTimeMs: Long
+        val isSystemApp: Boolean
     )
 }
